@@ -1,20 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  CallbackProperty,
   Cartesian2,
   Cartesian3,
   ClockRange,
   Color,
   Entity,
   ImageryLayer,
-  TileMapServiceImageryProvider,
-  buildModuleUrl,
   JulianDate,
   LabelStyle,
   LagrangePolynomialApproximation,
   NearFarScalar,
+  PolylineDashMaterialProperty,
+  PolylineGlowMaterialProperty,
   SampledPositionProperty,
+  TileMapServiceImageryProvider,
+  VelocityOrientationProperty,
   Viewer,
+  buildModuleUrl,
   Math as CesiumMath,
 } from "cesium";
 
@@ -38,17 +42,61 @@ import {
   buildCircularOrbit,
   buildManeuverTrajectory,
   buildTransferPath,
-  getTransferDuration,
   circularOrbitPeriod,
+  getTransferDuration,
 } from "../services/orbitPropagation";
+
+import {
+  formatMissionTime,
+  rotateOrbitPositions,
+} from "../services/orbitVisualization";
 
 interface OrbitPreviewProps {
   simulation: MissionSimulation;
+  onTimeChange?: (seconds: number) => void;
 }
 
-function OrbitPreview({ simulation }: OrbitPreviewProps) {
+const CAMERA_DESTINATION = {
+  longitude: -40,
+  latitude: 20,
+  height: 20_000_000,
+};
+
+function setOverviewCamera(viewer: Viewer, animate = false) {
+  const destination = Cartesian3.fromDegrees(
+    CAMERA_DESTINATION.longitude,
+    CAMERA_DESTINATION.latitude,
+    CAMERA_DESTINATION.height,
+  );
+
+  const orientation = {
+    heading: 0,
+    pitch: CesiumMath.toRadians(-90),
+    roll: 0,
+  };
+
+  if (animate) {
+    viewer.camera.flyTo({
+      destination,
+      orientation,
+      duration: 1.3,
+    });
+  } else {
+    viewer.camera.setView({
+      destination,
+      orientation,
+    });
+  }
+}
+
+function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
   const viewerRef = useRef<Viewer | null>(null);
   const satelliteRef = useRef<Entity | null>(null);
+  const startTimeRef = useRef<JulianDate | null>(null);
+
+  const onTimeChangeRef = useRef(onTimeChange);
+  const speedRef = useRef<number>(ORBIT_CONFIG.defaultSpeed);
+  const lastReportedSecondRef = useRef(-1);
 
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(true);
@@ -57,6 +105,8 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
     ORBIT_CONFIG.defaultSpeed,
   );
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+  const [error, setError] = useState<string | null>(null);
+
   const transferSeconds = getTransferDuration(
     simulation.currentAltitudeKm,
     simulation.targetAltitudeKm,
@@ -64,14 +114,10 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
 
   const totalSeconds =
     transferSeconds + circularOrbitPeriod(simulation.targetAltitudeKm);
-  const [error, setError] = useState<string | null>(null);
-
-  const startTimeRef = useRef<JulianDate | null>(null);
-  const speedRef = useRef(playbackSpeed);
 
   useEffect(() => {
-    speedRef.current = playbackSpeed;
-  }, [playbackSpeed]);
+    onTimeChangeRef.current = onTimeChange;
+  }, [onTimeChange]);
 
   const initializeCesium = useCallback((container: HTMLDivElement | null) => {
     if (!container) return;
@@ -100,64 +146,37 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
           ),
         ),
 
-        // Keep disabled until we confirm all skybox assets work.
+        // Avoid the missing skybox-texture problem
+        // encountered in the earlier setup.
         skyBox: false,
-
-        // Keep the atmosphere for the globe's blue edge.
-        // skyAtmosphere: true,
       });
 
       viewer = cesiumViewer;
       viewerRef.current = cesiumViewer;
 
-      cesiumViewer.scene.renderError.addEventListener((_scene, error) => {
-        console.error("[MissionOps] Cesium render error:", error);
-      });
+      const scene = cesiumViewer.scene;
 
-      console.log("[MissionOps] Viewer created", {
-        canvasWidth: cesiumViewer.canvas.width,
-        canvasHeight: cesiumViewer.canvas.height,
-        globeVisible: cesiumViewer.scene.globe.show,
-        renderLoopActive: cesiumViewer.useDefaultRenderLoop,
-      });
+      scene.globe.show = true;
+      scene.globe.baseColor = Color.fromCssColorString("#102844");
+      scene.backgroundColor = Color.fromCssColorString("#050d18");
 
-      // Globe appearance
-      cesiumViewer.scene.globe.show = true;
-      cesiumViewer.scene.globe.baseColor = Color.fromCssColorString("#102844");
+      scene.globe.enableLighting = false;
+      scene.globe.depthTestAgainstTerrain = false;
 
-      cesiumViewer.scene.backgroundColor = Color.fromCssColorString("#050d18");
-
-      cesiumViewer.scene.globe.enableLighting = false;
-
-      if (cesiumViewer.scene.skyAtmosphere) {
-        cesiumViewer.scene.skyAtmosphere.show = true;
+      if (scene.skyAtmosphere) {
+        scene.skyAtmosphere.show = true;
       }
 
-      cesiumViewer.scene.globe.depthTestAgainstTerrain = false;
-
-      // Camera controls
-      const controller = cesiumViewer.scene.screenSpaceCameraController;
+      const controller = scene.screenSpaceCameraController;
 
       controller.enableRotate = true;
       controller.enableZoom = true;
       controller.enableTilt = true;
 
-      // Initial camera position
+      setOverviewCamera(cesiumViewer);
 
-      cesiumViewer.camera.setView({
-        destination: Cartesian3.fromDegrees(
-          -40, // Longitude
-          20, // Latitude
-          20_000_000, // Height above Earth in meters
-        ),
-        orientation: {
-          heading: 0,
-          pitch: CesiumMath.toRadians(-90),
-          roll: 0,
-        },
-      });
-
-      // Update elapsed simulation time
+      // Report simulation time to React once
+      // per displayed simulation second.
       const handleTick = () => {
         if (disposed || cesiumViewer.isDestroyed() || !startTimeRef.current) {
           return;
@@ -168,11 +187,16 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
           startTimeRef.current,
         );
 
-        setElapsedSeconds((previous) => {
-          const next = Math.max(0, Math.floor(elapsed));
+        const second = Math.max(0, Math.floor(elapsed));
 
-          return previous === next ? previous : next;
-        });
+        if (second === lastReportedSecondRef.current) {
+          return;
+        }
+
+        lastReportedSecondRef.current = second;
+
+        setElapsedSeconds(second);
+        onTimeChangeRef.current?.(second);
       };
 
       cesiumViewer.clock.onTick.addEventListener(handleTick);
@@ -180,7 +204,6 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
       setError(null);
       setIsReady(true);
 
-      // React 19 callback-ref cleanup
       return () => {
         disposed = true;
 
@@ -211,9 +234,10 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
     }
   }, []);
 
-  // Update orbital objects when a new simulation is supplied.
+  // Rebuild orbital geometry only for new simulations.
   useEffect(() => {
     const viewer = viewerRef.current;
+
     if (!viewer || !isReady || viewer.isDestroyed()) {
       return;
     }
@@ -229,62 +253,91 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
       ORBIT_CONFIG.colors.transfer,
     );
 
-    // Current circular orbit.
-    const currentOrbit = buildCircularOrbit(simulation.currentAltitudeKm);
-
-    viewer.entities.add({
-      id: "current-orbit",
-      name: "Current Circular Orbit",
-      polyline: {
-        positions: [...currentOrbit, currentOrbit[0]],
-        width: 2.5,
-        material: currentColor,
-      },
-    });
-
-    // Target circular orbit.
-    const targetOrbit = buildCircularOrbit(simulation.targetAltitudeKm);
-
-    viewer.entities.add({
-      id: "target-orbit",
-      name: "Target Circular Orbit",
-      polyline: {
-        positions: [...targetOrbit, targetOrbit[0]],
-        width: 2.5,
-        material: targetColor,
-      },
-    });
-
-    // Elliptical transfer trajectory.
-    const transferPath = buildTransferPath(
-      simulation.currentAltitudeKm,
-      simulation.targetAltitudeKm,
-    );
-
-    viewer.entities.add({
-      id: "transfer-path",
-      name: "Hohmann Transfer Arc",
-      polyline: {
-        positions: transferPath,
-        width: 2,
-        material: transferColor.withAlpha(0.85),
-      },
-    });
+    const start = JulianDate.now();
 
     const trajectory = buildManeuverTrajectory(
       simulation.currentAltitudeKm,
       simulation.targetAltitudeKm,
     );
 
-    setElapsedSeconds(0);
-
-    const start = JulianDate.now();
     const stop = JulianDate.addSeconds(
       start,
       trajectory.totalDuration,
       new JulianDate(),
     );
 
+    startTimeRef.current = start;
+    lastReportedSecondRef.current = -1;
+
+    // Positions at the initial simulation epoch.
+    const currentOrbit = buildCircularOrbit(simulation.currentAltitudeKm);
+
+    const targetOrbit = buildCircularOrbit(simulation.targetAltitudeKm);
+
+    const transferArc = buildTransferPath(
+      simulation.currentAltitudeKm,
+      simulation.targetAltitudeKm,
+    );
+
+    const closeOrbit = (positions: Cartesian3[]): Cartesian3[] => [
+      ...positions,
+      positions[0],
+    ];
+
+    // Dynamically rotate orbit lines into the
+    // Earth-fixed frame as simulated time advances.
+    const createDynamicPositions = (basePositions: Cartesian3[]) =>
+      new CallbackProperty((time: JulianDate | undefined) => {
+        if (!time) return basePositions;
+
+        const elapsed = JulianDate.secondsDifference(time, start);
+
+        return rotateOrbitPositions(basePositions, elapsed);
+      }, false);
+
+    // Current orbit — solid blue glowing line.
+    viewer.entities.add({
+      id: "current-orbit",
+      name: "Current Circular Orbit",
+      polyline: {
+        positions: createDynamicPositions(closeOrbit(currentOrbit)),
+        width: 3.5,
+        material: new PolylineGlowMaterialProperty({
+          glowPower: 0.15,
+          color: currentColor,
+        }),
+      },
+    });
+
+    // Target orbit — dashed orange line.
+    viewer.entities.add({
+      id: "target-orbit",
+      name: "Target Circular Orbit",
+      polyline: {
+        positions: createDynamicPositions(closeOrbit(targetOrbit)),
+        width: 3,
+        material: new PolylineDashMaterialProperty({
+          color: targetColor,
+          dashLength: 18,
+        }),
+      },
+    });
+
+    // Hohmann transfer — teal dashed arc.
+    viewer.entities.add({
+      id: "transfer-path",
+      name: "Hohmann Transfer",
+      polyline: {
+        positions: createDynamicPositions(transferArc),
+        width: 2.5,
+        material: new PolylineDashMaterialProperty({
+          color: transferColor,
+          dashLength: 12,
+        }),
+      },
+    });
+
+    // Satellite trajectory from orbital propagation.
     const position = new SampledPositionProperty();
 
     for (const sample of trajectory.samples) {
@@ -302,17 +355,22 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
       interpolationAlgorithm: LagrangePolynomialApproximation,
     });
 
+    // Model orientation follows instantaneous velocity.
+    const orientation = new VelocityOrientationProperty(position);
+
     const satellite = viewer.entities.add({
       id: "mission-satellite",
       name: simulation.satelliteName,
       position,
+      orientation,
 
-      point: {
-        pixelSize: ORBIT_CONFIG.satellitePixelSize,
-        color: Color.WHITE,
-        outlineColor: currentColor,
-        outlineWidth: 3,
-        scaleByDistance: new NearFarScalar(1_000_000, 1.5, 40_000_000, 0.7),
+      // Local spacecraft model.
+      model: {
+        uri: "/models/missionops_satellite.glb",
+        scale: 1,
+        minimumPixelSize: 36,
+        maximumScale: 200_000,
+        runAnimations: true,
       },
 
       label: {
@@ -322,16 +380,16 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
         fillColor: Color.WHITE,
         outlineColor: Color.BLACK,
         outlineWidth: 3,
-        pixelOffset: new Cartesian2(0, -24),
+        pixelOffset: new Cartesian2(0, -28),
         showBackground: true,
-        backgroundColor: Color.fromCssColorString("#081321").withAlpha(0.8),
+        backgroundColor: Color.fromCssColorString("#081321").withAlpha(0.85),
         scaleByDistance: new NearFarScalar(1_000_000, 1, 35_000_000, 0.55),
       },
     });
 
     satelliteRef.current = satellite;
-    startTimeRef.current = start;
 
+    // Configure the Cesium simulation clock.
     viewer.clock.startTime = JulianDate.clone(start);
     viewer.clock.stopTime = JulianDate.clone(stop);
     viewer.clock.currentTime = JulianDate.clone(start);
@@ -339,30 +397,41 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
     viewer.clock.multiplier = speedRef.current;
     viewer.clock.shouldAnimate = true;
 
-    setIsFollowing(false);
+    setElapsedSeconds(0);
     setIsPlaying(true);
+    setIsFollowing(false);
+
+    onTimeChangeRef.current?.(0);
   }, [simulation, isReady]);
 
   const handlePlayPause = () => {
     const viewer = viewerRef.current;
+
     if (!viewer || viewer.isDestroyed()) return;
 
-    const next = !viewer.clock.shouldAnimate;
-    viewer.clock.shouldAnimate = next;
-    setIsPlaying(next);
+    const playing = !viewer.clock.shouldAnimate;
+
+    viewer.clock.shouldAnimate = playing;
+    setIsPlaying(playing);
   };
 
   const handleRestart = () => {
     const viewer = viewerRef.current;
     const start = startTimeRef.current;
 
-    if (!viewer || viewer.isDestroyed() || !start) return;
+    if (!viewer || viewer.isDestroyed() || !start) {
+      return;
+    }
 
     viewer.clock.currentTime = JulianDate.clone(start);
+
     viewer.clock.shouldAnimate = true;
+
+    lastReportedSecondRef.current = -1;
 
     setElapsedSeconds(0);
     setIsPlaying(true);
+    onTimeChangeRef.current?.(0);
   };
 
   const handleSpeedChange = (speed: number) => {
@@ -370,6 +439,7 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
     speedRef.current = speed;
 
     const viewer = viewerRef.current;
+
     if (!viewer || viewer.isDestroyed()) return;
 
     viewer.clock.multiplier = speed;
@@ -377,15 +447,13 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
 
   const handleResetCamera = () => {
     const viewer = viewerRef.current;
+
     if (!viewer || viewer.isDestroyed()) return;
 
     viewer.trackedEntity = undefined;
     setIsFollowing(false);
 
-    viewer.camera.flyTo({
-      destination: new Cartesian3(12_500_000, -15_000_000, 10_500_000),
-      duration: 1.5,
-    });
+    setOverviewCamera(viewer, true);
   };
 
   const handleFollowSatellite = () => {
@@ -411,9 +479,9 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
   const phase = elapsedSeconds < transferSeconds ? "Transfer" : "Target Orbit";
 
   return (
-    <section className="mission-card relative flex min-h-117.5 flex-col overflow-hidden">
+    <section className="mission-card relative flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="relative z-10 flex flex-wrap items-center justify-between gap-3 border-b border-white/6 px-5 py-4 sm:px-6">
+      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/6 px-5 py-4 sm:px-6">
         <div className="flex items-center gap-3">
           <div className="rounded-lg bg-blue-500/10 p-2.5">
             <Globe2 className="size-5 text-blue-400" />
@@ -423,6 +491,7 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
             <h2 className="text-base font-semibold text-white">
               Orbit Visualization
             </h2>
+
             <p className="mt-1 text-xs text-slate-400">
               Interactive 3D maneuver simulation
             </p>
@@ -431,13 +500,14 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
 
         <div className="flex items-center gap-2">
           <span className="size-2 rounded-full bg-teal-400" />
+
           <span className="text-xs text-slate-400">
             {isPlaying ? "Playing" : "Paused"}
           </span>
         </div>
       </div>
 
-      {/* Cesium canvas */}
+      {/* 3D globe */}
       <div className="relative h-105 w-full overflow-hidden bg-[#050d18]">
         <div ref={initializeCesium} className="mission-cesium-container" />
 
@@ -453,20 +523,20 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
           </div>
         )}
 
-        {/* Orbit legend */}
+        {/* Legend */}
         <div className="pointer-events-none absolute left-4 top-4 z-10 rounded-xl border border-white/10 bg-[#081321]/85 p-3 backdrop-blur-md">
           <div className="flex items-center gap-2 text-xs text-slate-300">
-            <span className="h-0.5 w-4 bg-[#3195ff]" />
+            <span className="h-0.75 w-5 rounded bg-[#3195ff]" />
             Current: {simulation.currentAltitudeKm} km
           </div>
 
           <div className="mt-2 flex items-center gap-2 text-xs text-slate-300">
-            <span className="h-0.5 w-4 bg-[#f59e0b]" />
+            <span className="w-5 border-t-2 border-dashed border-[#f59e0b]" />
             Target: {simulation.targetAltitudeKm} km
           </div>
 
           <div className="mt-2 flex items-center gap-2 text-xs text-slate-300">
-            <span className="h-0.5 w-4 bg-[#35d9c2]" />
+            <span className="w-5 border-t-2 border-dashed border-[#35d9c2]" />
             Transfer
           </div>
         </div>
@@ -497,20 +567,19 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
           </button>
         </div>
 
-        {/* Spacecraft label */}
-        <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex items-center gap-2 rounded-lg bg-[#081321]/80 px-3 py-2 text-xs text-slate-300 backdrop-blur-md">
+        <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex items-center gap-2 rounded-lg bg-[#081321]/85 px-3 py-2 text-xs text-slate-300">
           <Satellite className="size-4 text-blue-400" />
           {simulation.satelliteName}
         </div>
       </div>
 
-      {/* Playback controls */}
-      <div className="relative z-10 border-t border-white/6 bg-[#0b1827] px-5 py-4 sm:px-6">
-        <div className="mb-3 flex items-center justify-between gap-3">
+      {/* Playback */}
+      <div className="border-t border-white/6 bg-[#0b1827] px-5 py-4 sm:px-6">
+        <div className="mb-3 flex items-center justify-between">
           <span className="text-xs font-medium text-slate-300">{phase}</span>
 
           <span className="font-mono text-xs text-slate-400">
-            T+{Math.round(elapsedSeconds).toLocaleString()}s
+            T+{formatMissionTime(elapsedSeconds)}
           </span>
         </div>
 
@@ -527,8 +596,8 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
               type="button"
               onClick={handlePlayPause}
               className="mission-map-button"
-              title={isPlaying ? "Pause" : "Play"}
               aria-label={isPlaying ? "Pause" : "Play"}
+              title={isPlaying ? "Pause" : "Play"}
             >
               {isPlaying ? (
                 <Pause className="size-4 fill-current" />
@@ -541,13 +610,13 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
               type="button"
               onClick={handleRestart}
               className="mission-map-button"
+              aria-label="Restart"
               title="Restart"
-              aria-label="Restart animation"
             >
               <RotateCcw className="size-4" />
             </button>
 
-            <span className="ml-2 text-xs text-slate-500">
+            <span className="ml-2 hidden text-xs text-slate-500 sm:block">
               Animated trajectory
             </span>
           </div>
@@ -560,7 +629,7 @@ function OrbitPreview({ simulation }: OrbitPreviewProps) {
               onChange={(event) =>
                 handleSpeedChange(Number(event.target.value))
               }
-              className="rounded-lg border border-white/10 bg-[#091827] px-2.5 py-2 text-xs text-white outline-none focus:border-blue-500/50"
+              className="rounded-lg border border-white/10 bg-[#091827] px-2.5 py-2 text-xs text-white outline-none"
               aria-label="Playback speed"
             >
               {PLAYBACK_SPEEDS.map((speed) => (
