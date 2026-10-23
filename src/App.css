@@ -1,0 +1,47 @@
+.app {
+  --mission-background: #07111e;
+  --mission-card: #0d1c2c;
+  --mission-border: rgba(148, 163, 184, 0.12);
+  --mission-blue: #3195ff;
+
+  min-height: 100vh;
+  background: var(--mission-background);
+}
+
+.mission-card {
+  background: linear-gradient(
+    145deg,
+    rgba(16, 34, 53, 0.96),
+    rgba(10, 24, 39, 0.98)
+  );
+  border: 1px solid var(--mission-border);
+  border-radius: 14px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.08);
+}
+
+.mission-orbit-current {
+  transform-origin: 400px 242px;
+  animation: orbitRotate 90s linear infinite;
+}
+
+.mission-orbit-target {
+  transform-origin: 400px 242px;
+  animation: orbitRotate 120s linear infinite reverse;
+}
+
+@keyframes orbitRotate {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mission-orbit-current,
+  .mission-orbit-target {
+    animation: none;
+  }
+}
