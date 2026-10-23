@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import {
+  CallbackPositionProperty,
   CallbackProperty,
   Cartesian2,
   Cartesian3,
@@ -11,31 +12,36 @@ import {
   JulianDate,
   LabelStyle,
   LagrangePolynomialApproximation,
+  Math as CesiumMath,
   NearFarScalar,
   PolylineDashMaterialProperty,
   PolylineGlowMaterialProperty,
+  Rectangle,
   SampledPositionProperty,
+  SceneMode,
   TileMapServiceImageryProvider,
   VelocityOrientationProperty,
   Viewer,
   buildModuleUrl,
-  Math as CesiumMath,
 } from "cesium";
 
 import "cesium/Build/Cesium/Widgets/widgets.css";
 import "./OrbitPreview.css";
 
 import {
+  Focus,
+  Globe,
   Globe2,
+  LocateFixed,
+  Map,
   Pause,
   Play,
   RotateCcw,
-  Focus,
   Satellite,
-  LocateFixed,
 } from "lucide-react";
 
 import type { MissionSimulation } from "../types/mission";
+
 import { ORBIT_CONFIG, PLAYBACK_SPEEDS } from "../constants/orbit";
 
 import {
@@ -51,22 +57,56 @@ import {
   rotateOrbitPositions,
 } from "../services/orbitVisualization";
 
+import {
+  buildGroundTrack,
+  formatLatitude,
+  formatLongitude,
+  getGeographicPosition,
+  projectToGround,
+} from "../services/groundTrack";
+
+import type { GeographicPosition } from "../services/groundTrack";
+
+// -------------------------------------------
+// Types
+// -------------------------------------------
+
+type OrbitViewMode = "3d" | "ground-track";
+
 interface OrbitPreviewProps {
   simulation: MissionSimulation;
   onTimeChange?: (seconds: number) => void;
 }
 
-const CAMERA_DESTINATION = {
+// -------------------------------------------
+// Constants
+// -------------------------------------------
+
+const CAMERA_CONFIG = {
   longitude: -40,
   latitude: 20,
   height: 20_000_000,
 };
 
+const GROUND_TRACK_RECTANGLE = Rectangle.fromDegrees(-179.5, -80, 179.5, 80);
+
+const SATELLITE_MODEL_URL = "/models/missionops_satellite.glb";
+
+const COLORS = {
+  current: Color.fromCssColorString(ORBIT_CONFIG.colors.current),
+  target: Color.fromCssColorString(ORBIT_CONFIG.colors.target),
+  transfer: Color.fromCssColorString(ORBIT_CONFIG.colors.transfer),
+};
+
+// -------------------------------------------
+// Camera helper
+// -------------------------------------------
+
 function setOverviewCamera(viewer: Viewer, animate = false) {
   const destination = Cartesian3.fromDegrees(
-    CAMERA_DESTINATION.longitude,
-    CAMERA_DESTINATION.latitude,
-    CAMERA_DESTINATION.height,
+    CAMERA_CONFIG.longitude,
+    CAMERA_CONFIG.latitude,
+    CAMERA_CONFIG.height,
   );
 
   const orientation = {
@@ -89,24 +129,54 @@ function setOverviewCamera(viewer: Viewer, animate = false) {
   }
 }
 
+// -------------------------------------------
+// Component
+// -------------------------------------------
+
 function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
+  // Cesium references
   const viewerRef = useRef<Viewer | null>(null);
   const satelliteRef = useRef<Entity | null>(null);
+
   const startTimeRef = useRef<JulianDate | null>(null);
 
+  const spacecraftPositionRef = useRef<SampledPositionProperty | null>(null);
+
+  // Entity groups
+  const orbitEntitiesRef = useRef<Entity[]>([]);
+  const groundTrackEntitiesRef = useRef<Entity[]>([]);
+
+  // Callback references
   const onTimeChangeRef = useRef(onTimeChange);
+
   const speedRef = useRef<number>(ORBIT_CONFIG.defaultSpeed);
+
   const lastReportedSecondRef = useRef(-1);
 
+  // Current view reference for Cesium callbacks
+  const viewModeRef = useRef<OrbitViewMode>("3d");
+  const morphingRef = useRef(false);
+
+  // React states
   const [isReady, setIsReady] = useState(false);
   const [isPlaying, setIsPlaying] = useState(true);
   const [isFollowing, setIsFollowing] = useState(false);
+
+  const [viewMode, setViewMode] = useState<OrbitViewMode>("3d");
+
   const [playbackSpeed, setPlaybackSpeed] = useState<number>(
     ORBIT_CONFIG.defaultSpeed,
   );
+
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
+
+  const [geoPosition, setGeoPosition] = useState<GeographicPosition | null>(
+    null,
+  );
+
   const [error, setError] = useState<string | null>(null);
 
+  // Simulation durations
   const transferSeconds = getTransferDuration(
     simulation.currentAltitudeKm,
     simulation.targetAltitudeKm,
@@ -115,9 +185,17 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
   const totalSeconds =
     transferSeconds + circularOrbitPeriod(simulation.targetAltitudeKm);
 
+  // -------------------------------------------
+  // Keep callback reference current
+  // -------------------------------------------
+
   useEffect(() => {
     onTimeChangeRef.current = onTimeChange;
   }, [onTimeChange]);
+
+  // -------------------------------------------
+  // Initialize Cesium Viewer
+  // -------------------------------------------
 
   const initializeCesium = useCallback((container: HTMLDivElement | null) => {
     if (!container) return;
@@ -140,14 +218,15 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
         requestRenderMode: false,
         shouldAnimate: true,
 
+        // Local Natural Earth imagery
         baseLayer: ImageryLayer.fromProviderAsync(
           TileMapServiceImageryProvider.fromUrl(
             buildModuleUrl("Assets/Textures/NaturalEarthII"),
           ),
         ),
 
-        // Avoid the missing skybox-texture problem
-        // encountered in the earlier setup.
+        // Keep disabled because the default
+        // skybox caused asset decoding errors.
         skyBox: false,
       });
 
@@ -156,8 +235,11 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
 
       const scene = cesiumViewer.scene;
 
+      // Globe appearance
       scene.globe.show = true;
+
       scene.globe.baseColor = Color.fromCssColorString("#102844");
+
       scene.backgroundColor = Color.fromCssColorString("#050d18");
 
       scene.globe.enableLighting = false;
@@ -167,6 +249,7 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
         scene.skyAtmosphere.show = true;
       }
 
+      // Camera controls
       const controller = scene.screenSpaceCameraController;
 
       controller.enableRotate = true;
@@ -175,45 +258,81 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
 
       setOverviewCamera(cesiumViewer);
 
-      // Report simulation time to React once
-      // per displayed simulation second.
+      // -----------------------------------
+      // Clock listener
+      // -----------------------------------
+
       const handleTick = () => {
         if (disposed || cesiumViewer.isDestroyed() || !startTimeRef.current) {
           return;
         }
 
+        const currentTime = cesiumViewer.clock.currentTime;
+
         const elapsed = JulianDate.secondsDifference(
-          cesiumViewer.clock.currentTime,
+          currentTime,
           startTimeRef.current,
         );
 
         const second = Math.max(0, Math.floor(elapsed));
 
+        // Avoid redundant React updates.
         if (second === lastReportedSecondRef.current) {
           return;
         }
 
         lastReportedSecondRef.current = second;
 
+        // Synchronize playback UI
         setElapsedSeconds(second);
+
+        // Synchronize dashboard timeline
         onTimeChangeRef.current?.(second);
+
+        // Calculate current geographic position
+        const position = spacecraftPositionRef.current?.getValue(currentTime);
+
+        if (position) {
+          const geographic = getGeographicPosition(position);
+
+          setGeoPosition(geographic);
+        }
       };
 
       cesiumViewer.clock.onTick.addEventListener(handleTick);
 
+      // Render error monitoring
+      const removeRenderErrorListener = scene.renderError.addEventListener(
+        (_scene, renderError) => {
+          console.error("[MissionOps] Cesium render error:", renderError);
+        },
+      );
+
       setError(null);
       setIsReady(true);
+
+      // -----------------------------------
+      // React 19 callback-ref cleanup
+      // -----------------------------------
 
       return () => {
         disposed = true;
 
         cesiumViewer.clock.onTick.removeEventListener(handleTick);
 
+        removeRenderErrorListener();
+
         cesiumViewer.trackedEntity = undefined;
 
         satelliteRef.current = null;
         startTimeRef.current = null;
+        spacecraftPositionRef.current = null;
+
+        orbitEntitiesRef.current = [];
+        groundTrackEntitiesRef.current = [];
+
         viewerRef.current = null;
+        morphingRef.current = false;
 
         if (!cesiumViewer.isDestroyed()) {
           cesiumViewer.destroy();
@@ -234,7 +353,10 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
     }
   }, []);
 
-  // Rebuild orbital geometry only for new simulations.
+  // -------------------------------------------
+  // Build orbital simulation entities
+  // -------------------------------------------
+
   useEffect(() => {
     const viewer = viewerRef.current;
 
@@ -242,23 +364,21 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
       return;
     }
 
+    // Remove old mission objects
     viewer.trackedEntity = undefined;
     viewer.entities.removeAll();
 
-    const currentColor = Color.fromCssColorString(ORBIT_CONFIG.colors.current);
+    orbitEntitiesRef.current = [];
+    groundTrackEntitiesRef.current = [];
+    spacecraftPositionRef.current = null;
 
-    const targetColor = Color.fromCssColorString(ORBIT_CONFIG.colors.target);
-
-    const transferColor = Color.fromCssColorString(
-      ORBIT_CONFIG.colors.transfer,
-    );
-
-    const start = JulianDate.now();
-
+    // Generate trajectory
     const trajectory = buildManeuverTrajectory(
       simulation.currentAltitudeKm,
       simulation.targetAltitudeKm,
     );
+
+    const start = JulianDate.now();
 
     const stop = JulianDate.addSeconds(
       start,
@@ -269,7 +389,10 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
     startTimeRef.current = start;
     lastReportedSecondRef.current = -1;
 
-    // Positions at the initial simulation epoch.
+    // -----------------------------------
+    // Orbital geometry
+    // -----------------------------------
+
     const currentOrbit = buildCircularOrbit(simulation.currentAltitudeKm);
 
     const targetOrbit = buildCircularOrbit(simulation.targetAltitudeKm);
@@ -279,13 +402,13 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
       simulation.targetAltitudeKm,
     );
 
-    const closeOrbit = (positions: Cartesian3[]): Cartesian3[] => [
-      ...positions,
-      positions[0],
-    ];
+    const closeOrbit = (positions: Cartesian3[]): Cartesian3[] => {
+      if (positions.length === 0) return [];
 
-    // Dynamically rotate orbit lines into the
-    // Earth-fixed frame as simulated time advances.
+      return [...positions, positions[0]];
+    };
+
+    // Dynamic Earth-fixed orbit representation
     const createDynamicPositions = (basePositions: Cartesian3[]) =>
       new CallbackProperty((time: JulianDate | undefined) => {
         if (!time) return basePositions;
@@ -295,49 +418,76 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
         return rotateOrbitPositions(basePositions, elapsed);
       }, false);
 
-    // Current orbit — solid blue glowing line.
-    viewer.entities.add({
+    // -----------------------------------
+    // Current orbit - glowing blue
+    // -----------------------------------
+
+    const currentOrbitEntity = viewer.entities.add({
       id: "current-orbit",
       name: "Current Circular Orbit",
+
       polyline: {
         positions: createDynamicPositions(closeOrbit(currentOrbit)),
+
         width: 3.5,
+
         material: new PolylineGlowMaterialProperty({
           glowPower: 0.15,
-          color: currentColor,
+          color: COLORS.current,
         }),
       },
     });
 
-    // Target orbit — dashed orange line.
-    viewer.entities.add({
+    orbitEntitiesRef.current.push(currentOrbitEntity);
+
+    // -----------------------------------
+    // Target orbit - dashed orange
+    // -----------------------------------
+
+    const targetOrbitEntity = viewer.entities.add({
       id: "target-orbit",
       name: "Target Circular Orbit",
+
       polyline: {
         positions: createDynamicPositions(closeOrbit(targetOrbit)),
+
         width: 3,
+
         material: new PolylineDashMaterialProperty({
-          color: targetColor,
+          color: COLORS.target,
           dashLength: 18,
         }),
       },
     });
 
-    // Hohmann transfer — teal dashed arc.
-    viewer.entities.add({
+    orbitEntitiesRef.current.push(targetOrbitEntity);
+
+    // -----------------------------------
+    // Transfer orbit - dashed teal
+    // -----------------------------------
+
+    const transferOrbitEntity = viewer.entities.add({
       id: "transfer-path",
       name: "Hohmann Transfer",
+
       polyline: {
         positions: createDynamicPositions(transferArc),
+
         width: 2.5,
+
         material: new PolylineDashMaterialProperty({
-          color: transferColor,
+          color: COLORS.transfer,
           dashLength: 12,
         }),
       },
     });
 
-    // Satellite trajectory from orbital propagation.
+    orbitEntitiesRef.current.push(transferOrbitEntity);
+
+    // -----------------------------------
+    // Satellite trajectory
+    // -----------------------------------
+
     const position = new SampledPositionProperty();
 
     for (const sample of trajectory.samples) {
@@ -355,18 +505,23 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
       interpolationAlgorithm: LagrangePolynomialApproximation,
     });
 
-    // Model orientation follows instantaneous velocity.
+    spacecraftPositionRef.current = position;
+
     const orientation = new VelocityOrientationProperty(position);
+
+    // -----------------------------------
+    // 3D Satellite model
+    // -----------------------------------
 
     const satellite = viewer.entities.add({
       id: "mission-satellite",
       name: simulation.satelliteName,
+
       position,
       orientation,
 
-      // Local spacecraft model.
       model: {
-        uri: "/models/missionops_satellite.glb",
+        uri: SATELLITE_MODEL_URL,
         scale: 1,
         minimumPixelSize: 36,
         maximumScale: 200_000,
@@ -376,27 +531,161 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
       label: {
         text: simulation.satelliteName,
         font: "13px sans-serif",
+
         style: LabelStyle.FILL_AND_OUTLINE,
+
         fillColor: Color.WHITE,
         outlineColor: Color.BLACK,
         outlineWidth: 3,
+
         pixelOffset: new Cartesian2(0, -28),
+
         showBackground: true,
+
         backgroundColor: Color.fromCssColorString("#081321").withAlpha(0.85),
+
         scaleByDistance: new NearFarScalar(1_000_000, 1, 35_000_000, 0.55),
       },
     });
 
     satelliteRef.current = satellite;
+    orbitEntitiesRef.current.push(satellite);
 
-    // Configure the Cesium simulation clock.
+    // -----------------------------------
+    // Ground track geometry
+    // -----------------------------------
+
+    const groundTrack = buildGroundTrack(trajectory.samples);
+
+    groundTrack.segments.forEach((segment, index) => {
+      const entity = viewer.entities.add({
+        id: `ground-track-${index}`,
+        name: `Ground Track ${index + 1}`,
+
+        show: false,
+
+        polyline: {
+          positions: segment,
+          width: 3,
+          clampToGround: true,
+
+          material: COLORS.transfer.withAlpha(0.95),
+        },
+      });
+
+      groundTrackEntitiesRef.current.push(entity);
+    });
+
+    // -----------------------------------
+    // Current sub-satellite position
+    // -----------------------------------
+
+    const groundPosition = new CallbackPositionProperty(
+      (time: JulianDate | undefined) => {
+        if (!time) {
+          return undefined;
+        }
+
+        const spacecraftPosition = position.getValue(time);
+
+        if (!spacecraftPosition) {
+          return undefined;
+        }
+
+        return projectToGround(spacecraftPosition);
+      },
+      false,
+    );
+
+    const groundMarker = viewer.entities.add({
+      id: "ground-track-marker",
+
+      name: `${simulation.satelliteName} Ground Position`,
+
+      show: false,
+
+      position: groundPosition,
+
+      point: {
+        pixelSize: 12,
+
+        color: Color.WHITE,
+
+        outlineColor: COLORS.transfer,
+        outlineWidth: 4,
+
+        disableDepthTestDistance: Number.POSITIVE_INFINITY,
+      },
+
+      label: {
+        text: simulation.satelliteName,
+        font: "13px sans-serif",
+
+        style: LabelStyle.FILL_AND_OUTLINE,
+
+        fillColor: Color.WHITE,
+        outlineColor: Color.BLACK,
+        outlineWidth: 3,
+
+        pixelOffset: new Cartesian2(0, -24),
+
+        showBackground: true,
+
+        backgroundColor: Color.fromCssColorString("#081321").withAlpha(0.85),
+      },
+    });
+
+    groundTrackEntitiesRef.current.push(groundMarker);
+
+    // -----------------------------------
+    // Initialize geographic coordinates
+    // -----------------------------------
+
+    const initialPosition = position.getValue(start);
+
+    if (initialPosition) {
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setGeoPosition(getGeographicPosition(initialPosition));
+    }
+
+    // -----------------------------------
+    // Configure simulation clock
+    // -----------------------------------
+
     viewer.clock.startTime = JulianDate.clone(start);
+
     viewer.clock.stopTime = JulianDate.clone(stop);
+
     viewer.clock.currentTime = JulianDate.clone(start);
+
     viewer.clock.clockRange = ClockRange.LOOP_STOP;
+
     viewer.clock.multiplier = speedRef.current;
+
     viewer.clock.shouldAnimate = true;
 
+    // Apply currently selected view to new entities.
+    const show3D = viewModeRef.current === "3d";
+
+    if (viewer && !viewer.isDestroyed()) {
+      for (const entity of orbitEntitiesRef.current) {
+        const cesiumEntity = viewer.entities.getById(entity.id);
+
+        if (cesiumEntity) {
+          cesiumEntity.show = show3D;
+        }
+      }
+
+      for (const entity of groundTrackEntitiesRef.current) {
+        const cesiumEntity = viewer.entities.getById(entity.id);
+
+        if (cesiumEntity) {
+          cesiumEntity.show = !show3D;
+        }
+      }
+    }
+
+    // Keep the map in its selected mode.
     setElapsedSeconds(0);
     setIsPlaying(true);
     setIsFollowing(false);
@@ -404,14 +693,92 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
     onTimeChangeRef.current?.(0);
   }, [simulation, isReady]);
 
+  // -------------------------------------------
+  // View switching
+  // -------------------------------------------
+
+  const handleViewChange = (nextMode: OrbitViewMode) => {
+    const viewer = viewerRef.current;
+
+    if (
+      !viewer ||
+      viewer.isDestroyed() ||
+      nextMode === viewModeRef.current ||
+      morphingRef.current ||
+      viewer.scene.mode === SceneMode.MORPHING
+    ) {
+      return;
+    }
+
+    viewer.trackedEntity = undefined;
+    setIsFollowing(false);
+
+    morphingRef.current = true;
+
+    const scene = viewer.scene;
+
+    const removeListener = scene.morphComplete.addEventListener(() => {
+      removeListener();
+
+      morphingRef.current = false;
+
+      if (viewer.isDestroyed()) return;
+
+      if (nextMode === "ground-track") {
+        viewer.camera.setView({
+          destination: GROUND_TRACK_RECTANGLE,
+        });
+      } else {
+        setOverviewCamera(viewer, false);
+      }
+    });
+
+    viewModeRef.current = nextMode;
+    setViewMode(nextMode);
+
+    // Update entity visibility immediately.
+    const show3D = nextMode === "3d";
+
+    if (viewer && !viewer.isDestroyed()) {
+      for (const entity of orbitEntitiesRef.current) {
+        const cesiumEntity = viewer.entities.getById(entity.id);
+
+        if (cesiumEntity) {
+          cesiumEntity.show = show3D;
+        }
+      }
+
+      for (const entity of groundTrackEntitiesRef.current) {
+        const cesiumEntity = viewer.entities.getById(entity.id);
+
+        if (cesiumEntity) {
+          cesiumEntity.show = !show3D;
+        }
+      }
+    }
+
+    if (nextMode === "ground-track") {
+      scene.morphTo2D(1);
+    } else {
+      scene.morphTo3D(1);
+    }
+  };
+
+  // -------------------------------------------
+  // Playback controls
+  // -------------------------------------------
+
   const handlePlayPause = () => {
     const viewer = viewerRef.current;
 
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
 
     const playing = !viewer.clock.shouldAnimate;
 
     viewer.clock.shouldAnimate = playing;
+
     setIsPlaying(playing);
   };
 
@@ -431,36 +798,64 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
 
     setElapsedSeconds(0);
     setIsPlaying(true);
+
+    const initialPosition = spacecraftPositionRef.current?.getValue(start);
+
+    if (initialPosition) {
+      setGeoPosition(getGeographicPosition(initialPosition));
+    }
+
     onTimeChangeRef.current?.(0);
   };
 
   const handleSpeedChange = (speed: number) => {
     setPlaybackSpeed(speed);
+
     speedRef.current = speed;
 
     const viewer = viewerRef.current;
 
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewer || viewer.isDestroyed()) {
+      return;
+    }
 
     viewer.clock.multiplier = speed;
   };
 
+  // -------------------------------------------
+  // Camera controls
+  // -------------------------------------------
+
   const handleResetCamera = () => {
     const viewer = viewerRef.current;
 
-    if (!viewer || viewer.isDestroyed()) return;
+    if (!viewer || viewer.isDestroyed() || morphingRef.current) {
+      return;
+    }
 
     viewer.trackedEntity = undefined;
     setIsFollowing(false);
 
-    setOverviewCamera(viewer, true);
+    if (viewModeRef.current === "ground-track") {
+      viewer.camera.flyTo({
+        destination: GROUND_TRACK_RECTANGLE,
+        duration: 1.2,
+      });
+    } else {
+      setOverviewCamera(viewer, true);
+    }
   };
 
   const handleFollowSatellite = () => {
     const viewer = viewerRef.current;
     const satellite = satelliteRef.current;
 
-    if (!viewer || viewer.isDestroyed() || !satellite) {
+    if (
+      !viewer ||
+      viewer.isDestroyed() ||
+      !satellite ||
+      viewModeRef.current !== "3d"
+    ) {
       return;
     }
 
@@ -473,15 +868,23 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
     }
   };
 
+  // -------------------------------------------
+  // Derived UI state
+  // -------------------------------------------
+
   const progress =
     totalSeconds > 0 ? Math.min(100, (elapsedSeconds / totalSeconds) * 100) : 0;
 
   const phase = elapsedSeconds < transferSeconds ? "Transfer" : "Target Orbit";
 
+  // -------------------------------------------
+  // Render
+  // -------------------------------------------
+
   return (
     <section className="mission-card relative flex flex-col overflow-hidden">
       {/* Header */}
-      <div className="flex flex-wrap items-center justify-between gap-3 border-b border-white/6 px-5 py-4 sm:px-6">
+      <div className="flex flex-wrap items-center justify-between gap-4 border-b border-white/6 px-5 py-4 sm:px-6">
         <div className="flex items-center gap-3">
           <div className="rounded-lg bg-blue-500/10 p-2.5">
             <Globe2 className="size-5 text-blue-400" />
@@ -493,52 +896,108 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
             </h2>
 
             <p className="mt-1 text-xs text-slate-400">
-              Interactive 3D maneuver simulation
+              Interactive satellite maneuver simulation
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-2">
-          <span className="size-2 rounded-full bg-teal-400" />
+        <div className="flex flex-wrap items-center gap-3">
+          {/* View switcher */}
+          <div className="flex items-center rounded-lg border border-white/10 bg-[#081321] p-1">
+            <button
+              type="button"
+              onClick={() => handleViewChange("3d")}
+              aria-pressed={viewMode === "3d"}
+              className={`flex items-center gap-2 rounded-md px-3 py-2 text-xs font-medium transition-colors ${
+                viewMode === "3d"
+                  ? "bg-blue-500 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Globe className="size-4" />
+              3D Globe
+            </button>
 
-          <span className="text-xs text-slate-400">
-            {isPlaying ? "Playing" : "Paused"}
-          </span>
+            <button
+              type="button"
+              onClick={() => handleViewChange("ground-track")}
+              aria-pressed={viewMode === "ground-track"}
+              className={`flex items-center gap-2 rounded-md px-3 py-2 text-xs font-medium transition-colors ${
+                viewMode === "ground-track"
+                  ? "bg-blue-500 text-white"
+                  : "text-slate-400 hover:text-white"
+              }`}
+            >
+              <Map className="size-4" />
+              Ground Track
+            </button>
+          </div>
+
+          {/* Playing status */}
+          <div className="flex items-center gap-2">
+            <span
+              className={`size-2 rounded-full ${
+                isPlaying ? "bg-teal-400" : "bg-amber-400"
+              }`}
+            />
+
+            <span className="text-xs text-slate-400">
+              {isPlaying ? "Playing" : "Paused"}
+            </span>
+          </div>
         </div>
       </div>
 
-      {/* 3D globe */}
+      {/* Cesium visualization */}
       <div className="relative h-105 w-full overflow-hidden bg-[#050d18]">
         <div ref={initializeCesium} className="mission-cesium-container" />
 
+        {/* Error state */}
         {error && (
           <div className="absolute inset-0 z-30 flex items-center justify-center bg-[#081321] p-6 text-center">
             <p className="text-sm text-red-400">{error}</p>
           </div>
         )}
 
+        {/* Loading state */}
         {!isReady && !error && (
           <div className="pointer-events-none absolute inset-0 flex items-center justify-center text-sm text-slate-400">
-            Loading 3D Earth...
+            Loading Earth visualization...
           </div>
         )}
 
-        {/* Legend */}
+        {/* Orbit / Ground Track legend */}
         <div className="pointer-events-none absolute left-4 top-4 z-10 rounded-xl border border-white/10 bg-[#081321]/85 p-3 backdrop-blur-md">
-          <div className="flex items-center gap-2 text-xs text-slate-300">
-            <span className="h-0.75 w-5 rounded bg-[#3195ff]" />
-            Current: {simulation.currentAltitudeKm} km
-          </div>
+          {viewMode === "3d" ? (
+            <>
+              <div className="flex items-center gap-2 text-xs text-slate-300">
+                <span className="h-0.75 w-5 rounded bg-[#3195ff]" />
+                Current: {simulation.currentAltitudeKm} km
+              </div>
 
-          <div className="mt-2 flex items-center gap-2 text-xs text-slate-300">
-            <span className="w-5 border-t-2 border-dashed border-[#f59e0b]" />
-            Target: {simulation.targetAltitudeKm} km
-          </div>
+              <div className="mt-2 flex items-center gap-2 text-xs text-slate-300">
+                <span className="w-5 border-t-2 border-dashed border-[#f59e0b]" />
+                Target: {simulation.targetAltitudeKm} km
+              </div>
 
-          <div className="mt-2 flex items-center gap-2 text-xs text-slate-300">
-            <span className="w-5 border-t-2 border-dashed border-[#35d9c2]" />
-            Transfer
-          </div>
+              <div className="mt-2 flex items-center gap-2 text-xs text-slate-300">
+                <span className="w-5 border-t-2 border-dashed border-[#35d9c2]" />
+                Transfer
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="flex items-center gap-2 text-xs text-slate-300">
+                <span className="h-0.75 w-5 rounded bg-[#35d9c2]" />
+                Projected Ground Track
+              </div>
+
+              <div className="mt-2 flex items-center gap-2 text-xs text-slate-300">
+                <span className="size-2.5 rounded-full border-2 border-[#35d9c2] bg-white" />
+                Sub-satellite Position
+              </div>
+            </>
+          )}
         </div>
 
         {/* Camera controls */}
@@ -553,29 +1012,68 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
             <Focus className="size-4" />
           </button>
 
-          <button
-            type="button"
-            onClick={handleFollowSatellite}
-            title="Follow satellite"
-            aria-label="Follow satellite"
-            aria-pressed={isFollowing}
-            className={`mission-map-button ${
-              isFollowing ? "mission-map-button-active" : ""
-            }`}
-          >
-            <LocateFixed className="size-4" />
-          </button>
+          {viewMode === "3d" && (
+            <button
+              type="button"
+              onClick={handleFollowSatellite}
+              title="Follow satellite"
+              aria-label="Follow satellite"
+              aria-pressed={isFollowing}
+              className={`mission-map-button ${
+                isFollowing ? "mission-map-button-active" : ""
+              }`}
+            >
+              <LocateFixed className="size-4" />
+            </button>
+          )}
         </div>
 
-        <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex items-center gap-2 rounded-lg bg-[#081321]/85 px-3 py-2 text-xs text-slate-300">
+        {/* Satellite label */}
+        <div className="pointer-events-none absolute bottom-4 left-4 z-10 flex items-center gap-2 rounded-lg bg-[#081321]/85 px-3 py-2 text-xs text-slate-300 backdrop-blur-md">
           <Satellite className="size-4 text-blue-400" />
           {simulation.satelliteName}
         </div>
       </div>
 
-      {/* Playback */}
+      {/* Ground track geographic information */}
+      {viewMode === "ground-track" && (
+        <div className="grid grid-cols-1 gap-3 border-t border-white/6 bg-[#0b1827] p-4 sm:grid-cols-3 sm:p-5">
+          {/* Latitude */}
+          <div className="rounded-xl border border-white/[0.07] bg-[#101f30] px-4 py-3">
+            <p className="text-xs text-slate-400">Latitude</p>
+
+            <p className="mt-2 font-mono text-lg font-semibold text-white">
+              {geoPosition ? formatLatitude(geoPosition.latitude) : "—"}
+            </p>
+          </div>
+
+          {/* Longitude */}
+          <div className="rounded-xl border border-white/[0.07] bg-[#101f30] px-4 py-3">
+            <p className="text-xs text-slate-400">Longitude</p>
+
+            <p className="mt-2 font-mono text-lg font-semibold text-white">
+              {geoPosition ? formatLongitude(geoPosition.longitude) : "—"}
+            </p>
+          </div>
+
+          {/* Satellite altitude */}
+          <div className="rounded-xl border border-white/[0.07] bg-[#101f30] px-4 py-3">
+            <p className="text-xs text-slate-400">Satellite Altitude</p>
+
+            <p className="mt-2 font-mono text-lg font-semibold text-white">
+              {geoPosition ? geoPosition.altitudeKm.toFixed(2) : "—"}
+
+              <span className="ml-2 text-xs font-normal text-slate-500">
+                km
+              </span>
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* Playback controls */}
       <div className="border-t border-white/6 bg-[#0b1827] px-5 py-4 sm:px-6">
-        <div className="mb-3 flex items-center justify-between">
+        <div className="mb-3 flex items-center justify-between gap-3">
           <span className="text-xs font-medium text-slate-300">{phase}</span>
 
           <span className="font-mono text-xs text-slate-400">
@@ -583,21 +1081,25 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
           </span>
         </div>
 
+        {/* Playback progress */}
         <div className="h-1.5 overflow-hidden rounded-full bg-white/10">
           <div
             className="h-full rounded-full bg-blue-500 transition-[width] duration-150"
-            style={{ width: `${progress}%` }}
+            style={{
+              width: `${progress}%`,
+            }}
           />
         </div>
 
         <div className="mt-4 flex flex-wrap items-center justify-between gap-4">
+          {/* Playback buttons */}
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={handlePlayPause}
               className="mission-map-button"
-              aria-label={isPlaying ? "Pause" : "Play"}
               title={isPlaying ? "Pause" : "Play"}
+              aria-label={isPlaying ? "Pause" : "Play"}
             >
               {isPlaying ? (
                 <Pause className="size-4 fill-current" />
@@ -610,8 +1112,8 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
               type="button"
               onClick={handleRestart}
               className="mission-map-button"
-              aria-label="Restart"
               title="Restart"
+              aria-label="Restart"
             >
               <RotateCcw className="size-4" />
             </button>
@@ -621,6 +1123,7 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
             </span>
           </div>
 
+          {/* Playback speed */}
           <div className="flex items-center gap-2">
             <span className="text-xs text-slate-500">Speed</span>
 
@@ -629,7 +1132,7 @@ function OrbitPreview({ simulation, onTimeChange }: OrbitPreviewProps) {
               onChange={(event) =>
                 handleSpeedChange(Number(event.target.value))
               }
-              className="rounded-lg border border-white/10 bg-[#091827] px-2.5 py-2 text-xs text-white outline-none"
+              className="rounded-lg border border-white/10 bg-[#091827] px-2.5 py-2 text-xs text-white outline-none focus:border-blue-500/50"
               aria-label="Playback speed"
             >
               {PLAYBACK_SPEEDS.map((speed) => (
